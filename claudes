@@ -1,0 +1,1213 @@
+#!/usr/bin/env bash
+#
+# claudes — run N isolated Claude Desktop instances on macOS.
+#
+# Each instance is a cloned .app bundle with its own bundle id, its own Dock
+# icon, and its own --user-data-dir, so accounts / skills / MCP config stay
+# fully separate with no logout/login. Clones are self-healing against Claude's
+# auto-update via `repair` / `doctor`.
+#
+# Usage: claudes <command> [args]   (run with no args for help)
+#
+# https://github.com/thomascailhol/claudes — MIT. No secrets, no network calls.
+# Unofficial; not affiliated with Anthropic.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SOURCE_APP="/Applications/Claude.app"
+APPS_DIR="/Applications"
+DATA_ROOT="$HOME/Library/Application Support"
+# Data dir of the untouched original install (never a managed clone).
+ORIGINAL_DATA_DIR="$DATA_ROOT/Claude"
+
+# Directory this script really lives in — resolve symlinks so `assets/` is found
+# even when invoked via a symlink on PATH (e.g. /opt/homebrew/bin/claudes).
+_src="${BASH_SOURCE[0]}"
+while [[ -L "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" == /* ]] || _src="$_dir/$_src"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_src")" && pwd)"
+unset _src _dir
+# Optional override: if assets/claude-logo.svg exists next to the script its path
+# is used; otherwise the embedded default below is used (so the script is a
+# single self-contained file that works when copied/symlinked anywhere).
+LOGO_SVG="$SCRIPT_DIR/assets/claude-logo.svg"
+EMBEDDED_LOGO_D='M11.376 24L10.776 23.544L10.44 22.8L10.776 21.312L11.16 19.392L11.472 17.856L11.76 15.96L11.928 15.336L11.904 15.288L11.784 15.312L10.344 17.28L8.16 20.232L6.432 22.056L6.024 22.224L5.304 21.864L5.376 21.192L5.784 20.616L8.16 17.568L9.6 15.672L10.536 14.592L10.512 14.448H10.464L4.128 18.576L3 18.72L2.496 18.264L2.568 17.52L2.808 17.28L4.704 15.96L9.432 13.32L9.504 13.08L9.432 12.96H9.192L8.4 12.912L5.712 12.84L3.384 12.744L1.104 12.624L0.528 12.504L0 11.784L0.048 11.424L0.528 11.112L1.224 11.16L2.736 11.28L5.016 11.424L6.672 11.52L9.12 11.784H9.504L9.552 11.616L9.432 11.52L9.336 11.424L6.96 9.84L4.416 8.16L3.072 7.176L2.352 6.672L1.992 6.216L1.848 5.208L2.496 4.488L3.384 4.56L3.6 4.608L4.488 5.304L6.384 6.768L8.88 8.616L9.24 8.904L9.408 8.808V8.736L9.24 8.472L7.896 6.024L6.456 3.528L5.808 2.496L5.64 1.872C5.576 1.656 5.544 1.416 5.544 1.152L6.288 0.144001L6.696 0L7.704 0.144001L8.112 0.504001L8.736 1.92L9.72 4.152L11.28 7.176L11.736 8.088L11.976 8.904L12.072 9.168H12.24V9.024L12.36 7.296L12.6 5.208L12.84 2.52L12.912 1.752L13.296 0.840001L14.04 0.360001L14.616 0.624001L15.096 1.32L15.024 1.752L14.76 3.6L14.184 6.504L13.824 8.472H14.04L14.28 8.208L15.264 6.912L16.92 4.848L17.64 4.032L18.504 3.12L19.056 2.688H20.088L20.832 3.816L20.496 4.992L19.44 6.336L18.552 7.464L17.28 9.168L16.512 10.536L16.584 10.632H16.752L19.608 10.008L21.168 9.744L22.992 9.432L23.832 9.816L23.928 10.2L23.592 11.016L21.624 11.496L19.32 11.952L15.888 12.768L15.84 12.792L15.888 12.864L17.424 13.008L18.096 13.056H19.728L22.752 13.272L23.544 13.8L24 14.424L23.928 14.928L22.704 15.528L21.072 15.144L17.232 14.232L15.936 13.92H15.744V14.016L16.848 15.096L18.84 16.896L21.36 19.224L21.48 19.8L21.168 20.28L20.832 20.232L18.624 18.552L17.76 17.808L15.84 16.2H15.72V16.368L16.152 17.016L18.504 20.544L18.624 21.624L18.456 21.96L17.832 22.176L17.184 22.056L15.792 20.136L14.376 17.952L13.224 16.008L13.104 16.104L12.408 23.352L12.096 23.712L11.376 24Z'
+# The name this script was invoked as (so help/usage read nicely once installed).
+PROG="$(basename "$0")"
+# The chosen icon color is stored per-instance in its data dir so it survives
+# Claude auto-updates (which overwrite the bundle) and `repair` can re-apply it.
+ICON_SIDECAR=".claude-multi-icon"
+# Deterministic default palette; a name with no --color gets a stable pick.
+PALETTE=( "#D97757" "#2563EB" "#059669" "#7C3AED" "#DB2777" \
+          "#EA580C" "#0891B2" "#CA8A04" "#DC2626" "#475569" )
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_BLUE=$'\033[34m'; C_BOLD=$'\033[1m'
+else
+  C_RESET=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_BOLD=""
+fi
+
+info()  { printf '%s==>%s %s\n' "$C_BLUE"   "$C_RESET" "$*"; }
+ok()    { printf '%s✓%s %s\n'   "$C_GREEN"  "$C_RESET" "$*"; }
+warn()  { printf '%s!%s %s\n'   "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()   { printf '%s✗%s %s\n'   "$C_RED"    "$C_RESET" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+
+# Print a clear message if any command fails unexpectedly.
+trap 'err "unexpected failure at line $LINENO (see output above)"' ERR
+
+# ---------------------------------------------------------------------------
+# Preflight helpers
+# ---------------------------------------------------------------------------
+
+require_cmd() {
+  local missing=()
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+  done
+  if (( ${#missing[@]} )); then
+    die "missing required tool(s): ${missing[*]}"
+  fi
+}
+
+require_source_app() {
+  [[ -d "$SOURCE_APP" ]] || die "source app not found: $SOURCE_APP (install Claude Desktop first)"
+}
+
+# ---------------------------------------------------------------------------
+# Name / path derivation
+#
+# From a raw name (e.g. "work", "client-x", "Pro") we derive every path. The
+# name is preserved verbatim for the app label and data dir ("Claude Pro.app",
+# "Claude-Pro"); only the bundle-id suffix is slugified.
+# ---------------------------------------------------------------------------
+
+validate_name() {
+  local name="$1"
+  [[ -n "$name" ]] || die "instance name is required"
+  # Letters (accents OK, e.g. "Équipe"), digits, dot, dash, underscore, and
+  # single internal spaces (so multi-word names like "La Capitainerie" work).
+  # No leading/trailing/double spaces or slashes. Quote multi-word names on the
+  # CLI: add "La Capitainerie". UTF-8 locale so [[:alnum:]] matches accents.
+  local LC_ALL=en_US.UTF-8
+  if [[ ! "$name" =~ ^[[:alnum:]._-]+([[:space:]][[:alnum:]._-]+)*$ ]]; then
+    die "invalid name '$name' — letters, digits, '.', '-', '_' and single spaces only (quote multi-word names)"
+  fi
+  if [[ "$name" == "-"* ]]; then
+    die "invalid name '$name' — must not start with '-'"
+  fi
+}
+
+app_path()  { printf '%s/Claude %s.app' "$APPS_DIR" "$1"; }
+data_dir()  { printf '%s/Claude-%s' "$DATA_ROOT" "$1"; }
+# Same path but with a *literal* $HOME, for embedding in the wrapper so clones
+# are portable across users.
+# shellcheck disable=SC2016  # literal $HOME is intended (the wrapper expands it at runtime)
+data_dir_expr() { printf '$HOME/Library/Application Support/Claude-%s' "$1"; }
+
+# Strip accents (é → e), lowercase, and replace anything outside [a-z0-9._-]
+# with '-' for the bundle id. macOS iconv transliterates é as 'e, so drop the
+# leftover accent marks.
+slug() {
+  # iconv exits non-zero when it transliterates; don't let pipefail abort.
+  printf '%s' "$1" | { LC_ALL=en_US.UTF-8 iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || true; } \
+    | tr -d "'\`^~\"?" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g'
+}
+
+# Read a plist string key from a bundle's Info.plist ("" if absent).
+plist_get() {
+  local plist="$1" key="$2"
+  plutil -extract "$key" raw -o - "$plist" 2>/dev/null || true
+}
+
+# The CFBundleExecutable of the *source* app (do not hardcode "Claude").
+source_executable() {
+  local exe
+  exe="$(plist_get "$SOURCE_APP/Contents/Info.plist" CFBundleExecutable)"
+  [[ -n "$exe" ]] || die "cannot read CFBundleExecutable from $SOURCE_APP"
+  printf '%s' "$exe"
+}
+
+# The source CFBundleIdentifier (base for every clone's id).
+source_bundle_id() {
+  local id
+  id="$(plist_get "$SOURCE_APP/Contents/Info.plist" CFBundleIdentifier)"
+  [[ -n "$id" ]] || die "cannot read CFBundleIdentifier from $SOURCE_APP"
+  printf '%s' "$id"
+}
+
+# ---------------------------------------------------------------------------
+# Bundle-state inspection
+# ---------------------------------------------------------------------------
+
+# CFBundleShortVersionString of a bundle ("" if unreadable).
+bundle_version() { plist_get "$1/Contents/Info.plist" CFBundleShortVersionString; }
+
+# Is instance <name> on a different version than the source app?
+instance_is_outdated() {
+  local cur src
+  cur="$(bundle_version "$(app_path "$1")")"
+  src="$(bundle_version "$SOURCE_APP")"
+  [[ -n "$src" && "$cur" != "$src" ]]
+}
+
+# Is a file a Mach-O binary (the real Electron executable)?
+# Note: capture output first — `cmd | grep -q` under `set -o pipefail` returns
+# non-zero when grep closes the pipe early (SIGPIPE), causing false negatives.
+is_macho() {
+  [[ -f "$1" ]] || return 1
+  local desc; desc="$(file -b "$1" 2>/dev/null)"
+  [[ "$desc" == *Mach-O* ]]
+}
+
+# Is a file our shell wrapper? Read only the first two bytes: a shebang is "#!",
+# Mach-O magic is 0xCAFEBABE/0xFEEDFACE — neither starts with a null byte, so
+# this avoids the "ignored null byte" warning when probing the real binary.
+is_wrapper() {
+  [[ -f "$1" ]] || return 1
+  local sig; sig="$(head -c2 "$1" 2>/dev/null)"
+  [[ "$sig" == '#!' ]]
+}
+
+signature_status() {
+  local app="$1"
+  if ! codesign --verify --deep "$app" >/dev/null 2>&1; then
+    printf 'broken'
+    return
+  fi
+  local desc; desc="$(codesign -dv "$app" 2>&1)"
+  if [[ "$desc" == *adhoc* ]]; then
+    printf 'adhoc'
+  else
+    printf 'signed'
+  fi
+}
+
+# Does the instance's current wrapper carry --disable-gpu? Used to preserve the
+# flag across repair/icon operations that rewrite the wrapper.
+instance_gpu_flag() {
+  local exe w
+  exe="$(source_executable)"
+  w="$(app_path "$1")/Contents/MacOS/$exe"
+  if is_wrapper "$w" && grep -qF -- '--disable-gpu' "$w" 2>/dev/null; then
+    printf '1'
+  else
+    printf '0'
+  fi
+}
+
+# Is the instance's process currently running?
+instance_is_running() {
+  local exe; exe="$(source_executable)"
+  pgrep -f "Claude $1.app/Contents/MacOS/$exe" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Icon generation (optional — degrades gracefully if tools/asset are missing)
+# ---------------------------------------------------------------------------
+
+# Validate/normalize a hex color (#RGB or #RRGGBB).
+normalize_color() {
+  local c="$1"
+  [[ "$c" == "#"* ]] || c="#$c"
+  if [[ "$c" =~ ^#[0-9A-Fa-f]{6}$ || "$c" =~ ^#[0-9A-Fa-f]{3}$ ]]; then
+    printf '%s' "$c"
+  else
+    die "invalid color '$1' — use hex like #2563EB or #E35"
+  fi
+}
+
+# Validate/normalize a logo color spec: a single hex, or a two-tone split
+# "TOP/BOTTOM[:PCT[:ANGLE]]" — TOP covers the top PCT% of the star (default 50),
+# with the dividing line tilted ANGLE degrees (default 0).
+normalize_logo_spec() {
+  local spec="$1" colors rest top bot pct=50 angle=0
+  [[ "$spec" == */* ]] || { normalize_color "$spec"; return; }
+  colors="${spec%%:*}"; rest=""
+  [[ "$spec" == *:* ]] && rest="${spec#*:}"
+  top="$(normalize_color "${colors%%/*}")"; bot="$(normalize_color "${colors#*/}")"
+  if [[ -n "$rest" ]]; then
+    pct="${rest%%:*}"
+    [[ "$rest" == *:* ]] && angle="${rest#*:}"
+  fi
+  if [[ ! "$pct" =~ ^[0-9]+$ ]] || (( pct > 100 )); then
+    die "invalid split '$pct' in '$1' — use a percent 0-100, e.g. #6B55F6/#FFF869:25"
+  fi
+  [[ "$angle" =~ ^-?[0-9]+$ ]] \
+    || die "invalid angle '$angle' in '$1' — use whole degrees, e.g. #6B55F6/#FFF869:25:12"
+  printf '%s/%s:%s:%s' "$top" "$bot" "$pct" "$angle"
+}
+
+# Emit the SVG <defs> (if any) and fill value for a logo spec, as "DEFS|FILL".
+# The gradient runs top→bottom in the glyph's own 24×24 box with a hard stop.
+logo_fill() {
+  local spec="$1" colors rest top bot pct angle
+  if [[ "$spec" != */* ]]; then printf '|%s' "$spec"; return; fi
+  colors="${spec%%:*}"; rest="${spec#*:}"
+  top="${colors%%/*}"; bot="${colors#*/}"
+  pct="${rest%%:*}"; angle="${rest#*:}"
+  printf '%s|%s' "<defs><linearGradient id=\"logo\" gradientUnits=\"userSpaceOnUse\" x1=\"12\" y1=\"0\" x2=\"12\" y2=\"24\" gradientTransform=\"rotate($angle 12 12)\"><stop offset=\"$pct%\" stop-color=\"$top\"/><stop offset=\"$pct%\" stop-color=\"$bot\"/></linearGradient></defs>" "url(#logo)"
+}
+
+# Deterministic palette pick from the instance name.
+auto_color() {
+  local out sum
+  out="$(cksum <<<"$1")"; sum="${out%% *}"
+  printf '%s' "${PALETTE[$(( sum % ${#PALETTE[@]} ))]}"
+}
+
+# Read/write the per-instance color sidecar (in the data dir).
+# Line 1: background color. Line 2 (optional): logo color, default white.
+instance_color() {
+  local f; f="$(data_dir "$1")/$ICON_SIDECAR"
+  [[ -f "$f" ]] || return 0
+  head -n1 "$f" 2>/dev/null
+}
+instance_logo_color() {
+  local f c=""; f="$(data_dir "$1")/$ICON_SIDECAR"
+  [[ -f "$f" ]] && c="$(sed -n 2p "$f" 2>/dev/null)"
+  printf '%s' "${c:-#ffffff}"
+}
+# set_instance_color <name> <bg> [logo] — keeps the existing logo color if omitted.
+set_instance_color() {
+  local d logo="${3:-}"; d="$(data_dir "$1")"
+  mkdir -p "$d"
+  [[ -n "$logo" ]] || logo="$(instance_logo_color "$1")"
+  printf '%s\n%s\n' "$2" "$logo" > "$d/$ICON_SIDECAR"
+}
+
+# Which SVG rasterizer is available? (prefer rsvg-convert; qlmanage is fallback)
+pick_rasterizer() {
+  if   command -v rsvg-convert >/dev/null 2>&1; then printf 'rsvg'
+  elif command -v magick       >/dev/null 2>&1; then printf 'magick'
+  elif command -v convert      >/dev/null 2>&1; then printf 'convert'
+  elif command -v qlmanage     >/dev/null 2>&1; then printf 'qlmanage'
+  else printf ''
+  fi
+}
+
+svg_to_png() {
+  local svg="$1" size="$2" out="$3" r="$4" tmp
+  case "$r" in
+    rsvg)    rsvg-convert -w "$size" -h "$size" "$svg" -o "$out" ;;
+    magick)  magick  -background none "$svg" -resize "${size}x${size}" "$out" ;;
+    convert) convert -background none "$svg" -resize "${size}x${size}" "$out" ;;
+    qlmanage)
+      tmp="$(dirname "$out")"
+      qlmanage -t -s "$size" -o "$tmp" "$svg" >/dev/null 2>&1
+      mv -f "$tmp/$(basename "$svg").png" "$out" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The logo path 'd' — from assets/claude-logo.svg if present (override), else the
+# embedded default. Keeps the script self-contained yet customizable.
+logo_path_d() {
+  local d
+  if [[ -f "$LOGO_SVG" ]]; then
+    d="$(sed -n 's/.*d="\([^"]*\)".*/\1/p' "$LOGO_SVG")"
+    [[ -n "$d" ]] && { printf '%s' "$d"; return; }
+  fi
+  printf '%s' "$EMBEDDED_LOGO_D"
+}
+
+# Compose (colored squircle + logo in $3, default white) → .icns at $2. Returns
+# non-zero if the icon toolchain is unavailable.
+render_icns() {
+  local color="$1" out="$2" logo="${3:-#ffffff}" r d work iconset comp sz defs fill
+  r="$(pick_rasterizer)"
+  [[ -n "$r" ]] || return 1
+  command -v iconutil >/dev/null 2>&1 || return 1
+  d="$(logo_path_d)"
+  [[ -n "$d" ]] || return 1
+  fill="$(logo_fill "$logo")"; defs="${fill%%|*}"; fill="${fill#*|}"
+
+  work="$(mktemp -d)"
+  iconset="$work/icon.iconset"; comp="$work/icon.svg"
+  mkdir -p "$iconset"
+  # 1024 canvas, macOS squircle (824 art box, ~185 corner), logo centered ~50%.
+  cat > "$comp" <<SVG
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="$color"/>
+  <g transform="translate(296,296) scale(18)">$defs<path d="$d" fill="$fill"/></g>
+</svg>
+SVG
+  for sz in 16 32 64 128 256 512 1024; do
+    svg_to_png "$comp" "$sz" "$work/$sz.png" "$r" || { rm -rf "$work"; return 1; }
+  done
+  cp "$work/16.png"   "$iconset/icon_16x16.png"
+  cp "$work/32.png"   "$iconset/icon_16x16@2x.png"
+  cp "$work/32.png"   "$iconset/icon_32x32.png"
+  cp "$work/64.png"   "$iconset/icon_32x32@2x.png"
+  cp "$work/128.png"  "$iconset/icon_128x128.png"
+  cp "$work/256.png"  "$iconset/icon_128x128@2x.png"
+  cp "$work/256.png"  "$iconset/icon_256x256.png"
+  cp "$work/512.png"  "$iconset/icon_256x256@2x.png"
+  cp "$work/512.png"  "$iconset/icon_512x512.png"
+  cp "$work/1024.png" "$iconset/icon_512x512@2x.png"
+  iconutil -c icns "$iconset" -o "$out" >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+  rm -rf "$work"
+}
+
+# Apply the instance's chosen icon to its bundle (before re-signing).
+# Returns 0 if an icon was applied, 1 if skipped (no color, or tools missing).
+apply_icon() {
+  local name="$1" app="${2:-}" color plist iconfile res
+  color="$(instance_color "$name")"
+  [[ -n "$color" ]] || return 1   # no color chosen → leave default icon
+  if [[ -z "$(pick_rasterizer)" ]] || ! command -v iconutil >/dev/null 2>&1; then
+    warn "icon skipped for '$name' (need rsvg-convert / ImageMagick / qlmanage)"
+    return 1
+  fi
+  [[ -n "$app" ]] || app="$(app_path "$name")"
+  plist="$app/Contents/Info.plist"
+  iconfile="$(plist_get "$plist" CFBundleIconFile)"
+  [[ -n "$iconfile" ]] || iconfile="electron.icns"
+  [[ "$iconfile" == *.icns ]] || iconfile="$iconfile.icns"
+  res="$app/Contents/Resources/$iconfile"
+  info "rendering icon ($color, logo $(instance_logo_color "$name"))…"
+  render_icns "$color" "$res" "$(instance_logo_color "$name")" || { warn "icon render failed for '$name' — skipped"; return 1; }
+  # Drop the asset-catalog icon name so our .icns is the one macOS shows.
+  plutil -remove CFBundleIconName "$plist" >/dev/null 2>&1 || true
+  plutil -replace CFBundleIconFile -string "$iconfile" "$plist" >/dev/null 2>&1 || true
+  return 0
+}
+
+# Bust the Dock/Finder icon cache after changing an icon.
+refresh_icon_cache() {
+  touch "$1" 2>/dev/null || true
+  killall Dock >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Core bundle mutation — shared by `add` and `repair`, fully idempotent.
+# Given an existing bundle at <app>, this (re)establishes: renamed real binary
+# "<exe> Bin", wrapper "<exe>" injecting --user-data-dir, correct bundle id and
+# display name, cleared quarantine, and a fresh ad-hoc signature.
+# An optional 3rd arg targets a bundle at another path (used by `update` to
+# isolate a staged copy before swapping it in).
+# ---------------------------------------------------------------------------
+
+apply_isolation() {
+  local name="$1" disable_gpu="$2" app="${3:-}"
+  local macos exe bin wrapper newid data
+  [[ -n "$app" ]] || app="$(app_path "$name")"
+  macos="$app/Contents/MacOS"
+  exe="$(source_executable)"
+  bin="$macos/$exe Bin"
+  wrapper="$macos/$exe"
+  data="$(data_dir "$name")"
+  newid="$(source_bundle_id).$(slug "$name")"
+
+  [[ -d "$macos" ]] || die "malformed bundle (no Contents/MacOS): $app"
+
+  # 1. Ensure the real Mach-O binary lives at "<exe> Bin".
+  if is_macho "$bin"; then
+    :  # already normalized
+  elif is_macho "$wrapper"; then
+    # Fresh clone, or an auto-update just restored the single-binary layout:
+    # the real binary is sitting at the wrapper's name. Move it aside.
+    info "normalizing executable → \"$exe Bin\""
+    mv -f "$wrapper" "$bin"
+  else
+    die "cannot locate the real Claude binary inside $macos (bundle corrupted?)"
+  fi
+
+  # 2. (Re)write the wrapper. The data path keeps a *literal* $HOME (expanded at
+  #    runtime) so the clone is portable; $data_expr is substituted as-is and the
+  #    heredoc does not re-expand the $HOME inside it.
+  local gpu_flag="" data_expr
+  data_expr="$(data_dir_expr "$name")"
+  [[ "$disable_gpu" == "1" ]] && gpu_flag=' --disable-gpu'
+  cat > "$wrapper" <<EOF
+#!/bin/bash
+DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+exec "\$DIR/$exe Bin" --user-data-dir="$data_expr"$gpu_flag
+EOF
+  chmod +x "$wrapper"
+
+  # 3. Distinct bundle id + display name (Dock, Spotlight, notifications).
+  plutil -replace CFBundleIdentifier -string "$newid" "$app/Contents/Info.plist"
+  plutil -replace CFBundleDisplayName -string "Claude $name" "$app/Contents/Info.plist"
+
+  # 3b. Custom Dock icon, if a color was chosen for this instance. Must happen
+  #     before re-signing (it edits Resources + Info.plist).
+  local icon_applied=0
+  if apply_icon "$name" "$app"; then icon_applied=1; fi
+
+  # 4. Clear quarantine, then re-sign (mandatory — else macOS kills it silently).
+  xattr -cr "$app"
+  info "re-signing (ad-hoc)…"
+  codesign --force --deep --sign - "$app" >/dev/null 2>&1 \
+    || die "codesign failed for $app"
+  codesign --verify --deep "$app" >/dev/null 2>&1 \
+    || die "signature verification failed for $app"
+
+  ok "isolation applied: $app"
+  printf '  %sbundle id%s  %s\n' "$C_DIM" "$C_RESET" "$newid"
+  printf '  %sdata dir%s   %s\n' "$C_DIM" "$C_RESET" "$data"
+
+  # 5. Refresh the Dock so a new/changed icon shows immediately.
+  if (( icon_applied )); then
+    refresh_icon_cache "$app"
+    printf '  %sicon%s       %s (Dock refreshed)\n' "$C_DIM" "$C_RESET" "$(instance_color "$name")"
+  fi
+}
+
+# A bundle is a "conformant managed clone" when the wrapper is in place and the
+# renamed real binary exists — i.e. isolation is currently intact.
+is_conformant() {
+  local name="$1" app macos exe
+  app="$(app_path "$name")"
+  macos="$app/Contents/MacOS"
+  exe="$(source_executable)"
+  [[ -d "$app" ]] || return 1
+  is_wrapper "$macos/$exe" && is_macho "$macos/$exe Bin"
+}
+
+# Copy an instance's LOCAL config to another. This copies claude_desktop_config.json
+# only — UI preferences plus any local (stdio) MCP servers. It deliberately does
+# NOT copy config.json (which holds auth tokens), cookies, or session storage.
+#
+# Skills, routines (scheduled tasks) and account MCP connectors are NOT stored
+# here — they live on the Claude account (server-side). The way to "transfer"
+# those is to sign the target instance into the same account.
+copy_local_config() {
+  local from="$1" to="$2" src dst
+  if [[ "$from" == "original" ]]; then
+    src="$ORIGINAL_DATA_DIR"
+  else
+    src="$(data_dir "$from")"
+  fi
+  dst="$(data_dir "$to")"
+  [[ -d "$src" ]] || die "source data dir not found: $src (has '$from' been launched at least once?)"
+
+  mkdir -p "$dst"
+  if [[ -f "$src/claude_desktop_config.json" ]]; then
+    cp -f "$src/claude_desktop_config.json" "$dst/claude_desktop_config.json"
+    ok "copied local preferences + MCP config (no tokens/sessions)"
+  else
+    warn "no claude_desktop_config.json in '$from' — nothing local to copy"
+  fi
+}
+
+post_install_notes() {
+  local name="$1"
+  cat <<EOF
+
+${C_BOLD}Next steps for "$name":${C_RESET}
+  • Launch it from Spotlight / Finder as "Claude $name".
+  • First launch: macOS asks to access the keychain ("Claude Safe Storage").
+    This is expected (new ad-hoc signature) — click ${C_BOLD}Always Allow${C_RESET}.
+  • Black screen on first launch? Quit and re-run:
+        $PROG repair "$name" --disable-gpu
+  • ${C_YELLOW}OAuth warning:${C_RESET} sign in / connect MCP connectors on ${C_BOLD}one instance
+    at a time${C_RESET}. Doing two logins concurrently can land a token on the
+    wrong instance.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_add() {
+  local name="" from="" disable_gpu="auto" color="" logo="" no_icon=0
+  while (( $# )); do
+    case "$1" in
+      --from)        from="${2:-}"; shift 2 || die "--from needs a value";;
+      --from=*)      from="${1#*=}"; shift;;
+      --color)       color="${2:-}"; shift 2 || die "--color needs a value";;
+      --color=*)     color="${1#*=}"; shift;;
+      --logo-color)  logo="${2:-}"; shift 2 || die "--logo-color needs a value";;
+      --logo-color=*) logo="${1#*=}"; shift;;
+      --no-icon)     no_icon=1; shift;;
+      --disable-gpu) disable_gpu=1; shift;;
+      -*)            die "unknown option: $1";;
+      *)             if [[ -z "$name" ]]; then name="$1"; else die "unexpected argument: '$1' — quote multi-word names, e.g. add \"$name $1\""; fi; shift;;
+    esac
+  done
+  validate_name "$name"
+  require_source_app
+  require_cmd ditto plutil codesign xattr file
+
+  # Preserve an existing --disable-gpu unless one was explicitly requested.
+  [[ "$disable_gpu" == "auto" ]] && disable_gpu="$(instance_gpu_flag "$name")"
+
+  # Decide the icon color (explicit > existing choice > deterministic palette).
+  if (( ! no_icon )); then
+    if [[ -n "$color" ]]; then
+      color="$(normalize_color "$color")"
+    else
+      color="$(instance_color "$name")"
+      [[ -n "$color" ]] || color="$(auto_color "$name")"
+    fi
+    [[ -z "$logo" ]] || logo="$(normalize_logo_spec "$logo")"
+    set_instance_color "$name" "$color" "$logo"
+  fi
+
+  local app
+  app="$(app_path "$name")"
+
+  if [[ -d "$app" ]]; then
+    if is_conformant "$name"; then
+      info "'$name' already exists and is healthy — re-applying to be safe (idempotent)."
+      apply_isolation "$name" "$disable_gpu"
+      [[ -n "$from" ]] && copy_local_config "$from" "$name"
+      ok "'$name' is up to date."
+      return 0
+    fi
+    warn "'$name' exists but isolation is broken — repairing in place."
+    apply_isolation "$name" "$disable_gpu"
+    [[ -n "$from" ]] && copy_local_config "$from" "$name"
+    post_install_notes "$name"
+    return 0
+  fi
+
+  info "cloning $SOURCE_APP → $app"
+  ditto "$SOURCE_APP" "$app"
+
+  apply_isolation "$name" "$disable_gpu"
+  [[ -n "$from" ]] && copy_local_config "$from" "$name"
+  post_install_notes "$name"
+}
+
+cmd_repair() {
+  local name="" disable_gpu="auto"
+  while (( $# )); do
+    case "$1" in
+      --disable-gpu) disable_gpu=1; shift;;
+      -*)            die "unknown option: $1";;
+      *)             if [[ -z "$name" ]]; then name="$1"; else die "unexpected argument: $1"; fi; shift;;
+    esac
+  done
+  validate_name "$name"
+  require_source_app
+  require_cmd plutil codesign xattr file
+
+  local app
+  app="$(app_path "$name")"
+  [[ -d "$app" ]] || die "no such instance: '$name' (looked for $app)"
+
+  # Keep the existing --disable-gpu setting unless overridden on the CLI.
+  [[ "$disable_gpu" == "auto" ]] && disable_gpu="$(instance_gpu_flag "$name")"
+
+  info "repairing '$name'"
+  apply_isolation "$name" "$disable_gpu"
+  ok "'$name' repaired."
+}
+
+# Re-clone one instance from the current Claude.app, keeping its data dir.
+# Safe by construction: the new bundle is fully built and signed in a staging
+# dir first; only then is the old bundle moved aside (renamed to .app.old so
+# LaunchServices ignores it) and the new one moved into place. The data dir is
+# never touched, and is snapshotted first unless --no-backup.
+#
+# Must NOT be called from an `if`/`||` context: bash would then ignore errexit
+# inside it, and a failed ditto/mv could go on to swap in a broken bundle.
+update_one() {
+  local name="$1" backup="$2"
+  local app cur src gpu ts bdir staging
+  app="$(app_path "$name")"
+  cur="$(bundle_version "$app")"; src="$(bundle_version "$SOURCE_APP")"
+  instance_is_running "$name" && die "'$name' is running — quit it first"
+
+  info "updating '$name': ${cur:-?} → ${src:-?}"
+  gpu="$(instance_gpu_flag "$name")"   # read before the old wrapper goes away
+  ts="$(date +%Y%m%d-%H%M%S)"
+  bdir="$DATA_ROOT/claudes-backups/$name/$ts"
+  staging="$APPS_DIR/.claudes-staging/Claude $name.app"
+
+  # 1. Build + isolate + sign the new bundle off to the side.
+  rm -rf "$staging"; mkdir -p "$(dirname "$staging")"
+  info "cloning $SOURCE_APP → staging"
+  ditto "$SOURCE_APP" "$staging"
+  apply_isolation "$name" "$gpu" "$staging"
+
+  # 2. Snapshot the data dir (conversations live server-side, but local
+  #    sessions, routines, tokens and prefs live here — and a major version
+  #    bump may migrate them one-way on first launch).
+  mkdir -p "$bdir"
+  if [[ "$backup" == "1" && -d "$(data_dir "$name")" ]]; then
+    info "backing up data dir → $bdir/data"
+    ditto "$(data_dir "$name")" "$bdir/data"
+  fi
+
+  # 3. Swap: old bundle aside (instant, same volume), new one in.
+  mv "$app" "$bdir/Claude $name.app.old"
+  mv "$staging" "$app"
+  rmdir "$(dirname "$staging")" 2>/dev/null || true
+  refresh_icon_cache "$app"
+
+  ok "'$name' updated to $(bundle_version "$app")."
+  printf '  %sbackup%s     %s\n' "$C_DIM" "$C_RESET" "$bdir"
+  printf '  %srollback%s   mv "%s" ~/.Trash/ && mv "%s" "%s"' "$C_DIM" "$C_RESET" \
+    "$app" "$bdir/Claude $name.app.old" "$app"
+  [[ -d "$bdir/data" ]] && printf ' && rm -rf "%s" && mv "%s" "%s"' \
+    "$(data_dir "$name")" "$bdir/data" "$(data_dir "$name")"
+  printf '\n'
+}
+
+cmd_update() {
+  local names=() all=0 force=0 backup=1
+  while (( $# )); do
+    case "$1" in
+      --all)       all=1; shift;;
+      --force)     force=1; shift;;
+      --no-backup) backup=0; shift;;
+      -*)          die "unknown option: $1";;
+      *)           names+=("$1"); shift;;
+    esac
+  done
+  require_source_app
+  require_cmd ditto plutil codesign xattr file
+
+  if (( all )); then
+    (( ${#names[@]} == 0 )) || die "pass either --all or instance names, not both"
+    local n
+    while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(list_instance_names)
+    (( ${#names[@]} )) || { info "no managed instances found."; return 0; }
+  fi
+  (( ${#names[@]} )) || die "usage: $PROG update <name>... | --all [--force] [--no-backup]"
+
+  local name failed=0 updated=0
+  for name in "${names[@]}"; do
+    validate_name "$name"
+    [[ -d "$(app_path "$name")" ]] || die "no such instance: '$name' (looked for $(app_path "$name"))"
+    if [[ "$force" == "0" ]] && ! instance_is_outdated "$name"; then
+      ok "'$name' already up to date ($(bundle_version "$(app_path "$name")"))."
+      continue
+    fi
+    if instance_is_running "$name"; then
+      err "'$name' is running — quit it first, then retry (skipped)."
+      failed=$((failed + 1)); continue
+    fi
+    update_one "$name" "$backup"
+    updated=$((updated + 1))
+  done
+
+  if (( updated )); then
+    echo
+    info "first launch: click ${C_BOLD}Always Allow${C_RESET} on the \"Claude Safe Storage\" keychain prompt"
+    info "(new signature) — denying it would lock the instance out of its saved login."
+    info "once everything checks out, delete old backups: rm -rf \"$DATA_ROOT/claudes-backups\""
+  fi
+  (( failed == 0 ))
+}
+
+cmd_rename() {
+  local old="" new=""
+  while (( $# )); do
+    case "$1" in
+      -*) die "unknown option: $1";;
+      *)  if   [[ -z "$old" ]]; then old="$1"
+          elif [[ -z "$new" ]]; then new="$1"
+          else die "unexpected argument: '$1' — quote multi-word names, e.g. rename \"$old\" \"$new $1\""; fi
+          shift;;
+    esac
+  done
+  validate_name "$old"
+  validate_name "$new"
+  [[ "$old" != "$new" ]] || die "old and new names are the same"
+  require_source_app
+  require_cmd plutil codesign xattr file
+
+  local old_app new_app old_data new_data
+  old_app="$(app_path "$old")";  new_app="$(app_path "$new")"
+  old_data="$(data_dir "$old")"; new_data="$(data_dir "$new")"
+
+  [[ -d "$old_app" ]] || die "no such instance: '$old' (looked for $old_app)"
+  [[ ! -e "$new_app" ]]  || die "target already exists: $new_app"
+  [[ ! -e "$new_data" ]] || die "target data dir already exists: $new_data"
+  if instance_is_running "$old"; then
+    die "'$old' is running — quit it first, then retry"
+  fi
+
+  info "renaming '$old' → '$new'"
+  mv "$old_app" "$new_app"
+  [[ -d "$old_data" ]] && mv "$old_data" "$new_data"
+
+  # Rebuild wrapper (new data path), bundle id, display name, icon; re-sign.
+  # Preserve the existing --disable-gpu flag.
+  apply_isolation "$new" "$(instance_gpu_flag "$new")"
+  ok "renamed to '$new'."
+  [[ -d "$new_data" ]] || warn "note: '$new' had no data dir yet (never launched)."
+  warn "if it was pinned in the Dock, remove the old (broken) item and re-add it."
+}
+
+cmd_transfer() {
+  local from="" to=""
+  while (( $# )); do
+    case "$1" in
+      -*) die "unknown option: $1";;
+      *)  if   [[ -z "$from" ]]; then from="$1"
+          elif [[ -z "$to" ]];   then to="$1"
+          else die "unexpected argument: '$1' — quote multi-word names"; fi
+          shift;;
+    esac
+  done
+  [[ -n "$from" && -n "$to" ]] || die "usage: $PROG transfer <from|original> <to>"
+  validate_name "$to"
+  [[ "$from" == "original" ]] || validate_name "$from"
+  [[ "$from" != "$to" ]] || die "source and target are the same"
+  require_source_app
+  [[ -d "$(app_path "$to")" ]] || die "no such instance: '$to' — create it first with '$PROG add'"
+
+  info "transferring local config: '$from' → '$to'"
+  copy_local_config "$from" "$to"
+  if instance_is_running "$to"; then
+    warn "'$to' is running — quit and reopen it to load the copied config."
+  fi
+  ok "done."
+  info "skills & connectors come with the account — sign '$to' into the same"
+  info "account to inherit those. Local routines stay per-instance: list them"
+  info "with '$PROG routines <src>' and recreate them in '$to'."
+}
+
+cmd_routines() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: $PROG routines <instance>|original"
+  local dir
+  if [[ "$name" == "original" ]]; then
+    dir="$ORIGINAL_DATA_DIR"
+  else
+    validate_name "$name"
+    dir="$(data_dir "$name")"
+  fi
+  [[ -d "$dir" ]] || die "no data dir for '$name' (has it been launched?)"
+
+  local sessroot="$dir/claude-code-sessions"
+  if [[ ! -d "$sessroot" ]]; then
+    info "no local-agent sessions in '$name' — no routines to list."
+    return 0
+  fi
+
+  info "local routines in '$name' (read-only — recreate these in the target instance):"
+  echo
+  # Dedupe by scheduledTaskId without associative arrays (macOS bash is 3.2).
+  local seen=" " found=0 f sid title cwd prompt
+  while IFS= read -r -d '' f; do
+    sid="$(plutil -extract scheduledTaskId raw -o - "$f" 2>/dev/null || true)"
+    [[ -n "$sid" && "$sid" != "null" ]] || continue
+    case "$seen" in *" $sid "*) continue ;; esac
+    seen="$seen$sid "
+    title="$(plutil -extract title raw -o - "$f" 2>/dev/null || true)"
+    cwd="$(plutil -extract cwd raw -o - "$f" 2>/dev/null || true)"
+    prompt="$(plutil -extract promptSuggestion raw -o - "$f" 2>/dev/null || true)"
+    found=$((found + 1))
+    printf '%s• %s%s\n' "$C_BOLD" "${title:-$sid}" "$C_RESET"
+    [[ -n "$cwd" ]]    && printf '    dir:    %s\n' "$cwd"
+    [[ -n "$prompt" ]] && printf '    prompt: %s\n' "$prompt"
+    printf '    id:     %s\n\n' "$sid"
+  done < <(find "$sessroot" -name 'local_*.json' -type f -print0 2>/dev/null)
+
+  if (( found == 0 )); then
+    info "no scheduled routines found in '$name'."
+  else
+    ok "$found routine(s)."
+    info "The schedule itself is stored encrypted per-instance and can't be exported —"
+    info "re-enter the timing when you recreate each routine in the target instance."
+  fi
+}
+
+cmd_remove() {
+  local name="" keep_data=0 assume_yes=0
+  while (( $# )); do
+    case "$1" in
+      --keep-data) keep_data=1; shift;;
+      -y|--yes)    assume_yes=1; shift;;
+      -*)          die "unknown option: $1";;
+      *)           if [[ -z "$name" ]]; then name="$1"; else die "unexpected argument: $1"; fi; shift;;
+    esac
+  done
+  validate_name "$name"
+
+  local app data
+  app="$(app_path "$name")"
+  data="$(data_dir "$name")"
+
+  # Guardrails: never touch the original install.
+  [[ "$app" != "$SOURCE_APP" ]] || die "refusing to remove the original app"
+  [[ "$data" != "$ORIGINAL_DATA_DIR" ]] || die "refusing to remove the original data dir"
+
+  [[ -d "$app" || -d "$data" ]] || die "nothing to remove for '$name'"
+
+  printf 'About to delete:\n'
+  [[ -d "$app" ]]  && printf '  app   %s\n' "$app"
+  if [[ "$keep_data" == "0" && -d "$data" ]]; then
+    printf '  data  %s\n' "$data"
+  elif [[ -d "$data" ]]; then
+    printf '  data  %s %s(kept)%s\n' "$data" "$C_DIM" "$C_RESET"
+  fi
+
+  if [[ "$assume_yes" == "0" ]]; then
+    printf '%sProceed? [y/N] %s' "$C_YELLOW" "$C_RESET"
+    local reply; read -r reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted."; return 0; }
+  fi
+
+  if [[ -d "$app" ]]; then
+    rm -rf "$app"
+    ok "removed $app"
+  fi
+  if [[ "$keep_data" == "0" && -d "$data" ]]; then
+    rm -rf "$data"
+    ok "removed $data"
+  fi
+}
+
+# Enumerate managed clones: "/Applications/Claude <name>.app" bundles (the space
+# excludes the original "Claude.app") that carry our "<source id>.<slug>" bundle
+# id, or that have a "Claude-<name>" data dir (an auto-update may have reset the
+# id). Unrelated apps that merely start with "Claude " are never touched.
+# Prints raw names, one per line.
+list_instance_names() {
+  local app base name id prefix
+  prefix="$(source_bundle_id)."
+  shopt -s nullglob
+  for app in "$APPS_DIR"/Claude\ *.app; do
+    base="$(basename "$app" .app)"      # "Claude <name>"
+    name="${base#Claude }"              # "<name>"
+    [[ -n "$name" ]] || continue
+    id="$(plist_get "$app/Contents/Info.plist" CFBundleIdentifier)"
+    if [[ "$id" == "$prefix"* || -d "$(data_dir "$name")" ]]; then
+      printf '%s\n' "$name"
+    fi
+  done
+  shopt -u nullglob
+}
+
+# Right-pad $1 with spaces to $2 characters (character-aware, unlike printf %-Ns).
+pad() {
+  local LC_ALL=en_US.UTF-8
+  local s="$1" w="$2"
+  printf '%s%*s' "$s" $(( w > ${#s} ? w - ${#s} : 0 )) ''
+}
+
+cmd_list() {
+  require_source_app
+  require_cmd plutil codesign file
+
+  local names
+  names="$(list_instance_names)"
+  if [[ -z "$names" ]]; then
+    info "no managed instances found. Create one with: $PROG add <name>"
+    return 0
+  fi
+
+  # Size the NAME / BUNDLE ID columns to fit (counting characters, not bytes,
+  # so accented names like "Équipe" line up).
+  local name app id nw=4 iw=9 LC_ALL=en_US.UTF-8
+  while IFS= read -r name; do
+    id="$(plist_get "$(app_path "$name")/Contents/Info.plist" CFBundleIdentifier)"
+    (( ${#name} > nw )) && nw=${#name}
+    (( ${#id} > iw )) && iw=${#id}
+  done <<< "$names"
+
+  printf '%s%s %s %-12s %-8s %-8s %-6s%s\n' \
+    "$C_BOLD" "$(pad "NAME" "$nw")" "$(pad "BUNDLE ID" "$iw")" "VERSION" "DATA" "ISOLATED" "SIGN" "$C_RESET"
+
+  local data ver isolated size sig
+  while IFS= read -r name; do
+    app="$(app_path "$name")"
+    data="$(data_dir "$name")"
+    id="$(plist_get "$app/Contents/Info.plist" CFBundleIdentifier)"
+    [[ -n "$id" ]] || id="(none)"
+    if is_conformant "$name"; then isolated="yes"; else isolated="NO"; fi
+    if [[ -d "$data" ]]; then
+      size="$(du -sh "$data" 2>/dev/null | cut -f1)"
+    else
+      size="—"
+    fi
+    sig="$(signature_status "$app")"
+    ver="$(bundle_version "$app")"
+    instance_is_outdated "$name" && ver="${ver:-?}*"
+    printf '%s %s %-12s %-8s %-8s %-6s\n' "$(pad "$name" "$nw")" "$(pad "$id" "$iw")" "${ver:-?}" "$size" "$isolated" "$sig"
+  done <<< "$names"
+  printf '%s* = older than %s (%s) — run: %s update --all%s\n' \
+    "$C_DIM" "$SOURCE_APP" "$(bundle_version "$SOURCE_APP")" "$PROG" "$C_RESET"
+}
+
+cmd_doctor() {
+  local fix=0
+  while (( $# )); do
+    case "$1" in
+      --fix) fix=1; shift;;
+      -*)    die "unknown option: $1";;
+      *)     die "unexpected argument: $1";;
+    esac
+  done
+  require_source_app
+  require_cmd plutil codesign xattr file
+
+  local names
+  names="$(list_instance_names)"
+  if [[ -z "$names" ]]; then
+    info "no managed instances found."
+    return 0
+  fi
+
+  local exe; exe="$(source_executable)"
+  local broken=() outdated=() name app macos problems sig
+  while IFS= read -r name; do
+    app="$(app_path "$name")"
+    macos="$app/Contents/MacOS"
+    problems=()
+
+    is_wrapper "$macos/$exe"   || problems+=("wrapper missing/overwritten")
+    is_macho "$macos/$exe Bin" || problems+=("renamed binary '$exe Bin' missing")
+    if is_wrapper "$macos/$exe"; then
+      local want; want="--user-data-dir=\"$(data_dir_expr "$name")\""
+      grep -qF -- "$want" "$macos/$exe" 2>/dev/null \
+        || problems+=("wrapper points at wrong/no data dir")
+    fi
+    sig="$(signature_status "$app")"
+    [[ "$sig" == "broken" ]] && problems+=("invalid signature")
+
+    if (( ${#problems[@]} )); then
+      err "$name: ${problems[*]}"
+      broken+=("$name")
+    else
+      ok "$name: healthy ($sig, $(bundle_version "$app"))"
+    fi
+    instance_is_outdated "$name" && outdated+=("$name")
+  done <<< "$names"
+
+  if (( ${#outdated[@]} )); then
+    warn "outdated vs $SOURCE_APP ($(bundle_version "$SOURCE_APP")): ${outdated[*]}"
+    warn "update them (data kept, backup made): $PROG update --all"
+  fi
+
+  if (( ${#broken[@]} == 0 )); then
+    ok "all instances healthy."
+    return 0
+  fi
+
+  if (( fix )); then
+    info "auto-repairing ${#broken[@]} instance(s)…"
+    for name in "${broken[@]}"; do
+      apply_isolation "$name" "$(instance_gpu_flag "$name")"
+    done
+    ok "repair complete."
+  else
+    warn "run with --fix to repair: $PROG doctor --fix"
+    return 1
+  fi
+}
+
+cmd_icon() {
+  local name="" color="" logo=""
+  while (( $# )); do
+    case "$1" in
+      --color)   color="${2:-}"; shift 2 || die "--color needs a value";;
+      --color=*) color="${1#*=}"; shift;;
+      --logo-color)   logo="${2:-}"; shift 2 || die "--logo-color needs a value";;
+      --logo-color=*) logo="${1#*=}"; shift;;
+      -*)        die "unknown option: $1";;
+      *)         if [[ -z "$name" ]]; then name="$1"; else die "unexpected argument: $1"; fi; shift;;
+    esac
+  done
+  validate_name "$name"
+  require_source_app
+  require_cmd plutil codesign xattr file
+
+  local app; app="$(app_path "$name")"
+  [[ -d "$app" ]] || die "no such instance: '$name' (looked for $app)"
+
+  if [[ -n "$color" ]]; then
+    color="$(normalize_color "$color")"
+  else
+    color="$(instance_color "$name")"
+    [[ -n "$color" ]] || color="$(auto_color "$name")"
+  fi
+  [[ -z "$logo" ]] || logo="$(normalize_logo_spec "$logo")"
+  set_instance_color "$name" "$color" "$logo"
+
+  info "setting icon for '$name' ($color, logo $(instance_logo_color "$name"))"
+  # Re-apply everything (idempotent); preserves the existing --disable-gpu flag.
+  apply_isolation "$name" "$(instance_gpu_flag "$name")"
+  ok "'$name' icon set."
+}
+
+# Default install location: a user-owned dir (best practice — don't drop
+# symlinks into Homebrew's managed dirs). Override with `install --dir`.
+choose_bindir() { printf '%s' "$HOME/.local/bin"; }
+
+on_path() { case ":$PATH:" in *":$1:"*) return 0;; *) return 1;; esac; }
+
+cmd_install() {
+  local link_name="claudes" bindir=""
+  while (( $# )); do
+    case "$1" in
+      --dir)   bindir="${2:-}"; shift 2 || die "--dir needs a value";;
+      --dir=*) bindir="${1#*=}"; shift;;
+      -*)      die "unknown option: $1";;
+      *)       link_name="$1"; shift;;
+    esac
+  done
+  [[ "$link_name" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid command name '$link_name'"
+
+  [[ -n "$bindir" ]] || bindir="$(choose_bindir)"
+  mkdir -p "$bindir" || die "cannot create $bindir"
+  [[ -w "$bindir" ]] || die "no write permission for $bindir (try: sudo, or --dir ~/.local/bin)"
+
+  local target link
+  target="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"; link="$bindir/$link_name"
+  if [[ -e "$link" || -L "$link" ]]; then
+    local cur; cur="$(readlink "$link" 2>/dev/null || true)"
+    if [[ "$cur" == "$target" ]]; then
+      ok "already installed: $link → $target"
+    else
+      die "$link already exists (points to '${cur:-a file}') — remove it or pick another name"
+    fi
+  else
+    ln -s "$target" "$link"
+    ok "installed: $link → $target"
+  fi
+
+  if on_path "$bindir"; then
+    printf '\nRun it from anywhere:\n  %s%s list%s\n' "$C_BOLD" "$link_name" "$C_RESET"
+  else
+    warn "$bindir is not on your PATH. Add this to ~/.zshrc:"
+    # shellcheck disable=SC2016  # literal $PATH is intentional in the printed hint
+    printf '  export PATH="%s:$PATH"\n' "$bindir"
+  fi
+}
+
+cmd_uninstall() {
+  local link_name="claudes" bindir=""
+  while (( $# )); do
+    case "$1" in
+      --dir)   bindir="${2:-}"; shift 2 || die "--dir needs a value";;
+      --dir=*) bindir="${1#*=}"; shift;;
+      -*)      die "unknown option: $1";;
+      *)       link_name="$1"; shift;;
+    esac
+  done
+  [[ -n "$bindir" ]] || bindir="$(choose_bindir)"
+  local link="$bindir/$link_name"
+  local target; target="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+  [[ -L "$link" ]] || die "not installed at $link"
+  local cur; cur="$(readlink "$link" 2>/dev/null || true)"
+  [[ "$cur" == "$target" ]] || die "$link does not point to this script (points to '${cur:-?}') — leaving it alone"
+  rm -f "$link"
+  ok "removed $link"
+}
+
+cmd_version() { printf 'claudes %s\n' "$VERSION"; }
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}claudes${C_RESET} $VERSION — isolated Claude Desktop instances on macOS
+
+${C_BOLD}Usage:${C_RESET} $PROG <command> [args]
+
+${C_BOLD}Commands:${C_RESET}
+  add <name> [--from <inst>|original] [--color <hex>] [--logo-color <spec>] [--no-icon] [--disable-gpu]
+        Clone Claude.app into an isolated instance "Claude <name>.app" with its
+        own data dir. Idempotent — re-running repairs in place.
+        --from   copy local preferences + MCP config from another instance
+                 (NOT skills/routines — those are account-side; never tokens).
+        --color  Dock icon background color (e.g. #2563EB). Default: a stable
+                 per-name color from the built-in palette. --no-icon keeps stock.
+        --logo-color  color of the Claude star (default #ffffff), or a two-tone
+                 split TOP/BOTTOM[:PCT[:ANGLE]], e.g. '#6B55F6/#FFF869:25:12'
+                 = top 25% purple, rest yellow, split line tilted 12°.
+        --disable-gpu  add the flag to the wrapper (fixes black-screen bug).
+
+  transfer <from>|original <to>
+        Copy local preferences + MCP config into an existing instance <to>.
+        Skills & connectors come with the account (sign in); local routines
+        stay per-instance — see 'routines'.
+
+  routines <instance>|original
+        List an instance's local routines (title, working dir, prompt) so you
+        can recreate them in another instance. Read-only; can't export the
+        schedule (it's stored encrypted per-instance).
+
+  icon <name> [--color <hex>] [--logo-color <spec>]
+        (Re)generate the Dock icon — Claude star on a colored squircle.
+        Omitted colors keep the current choice (background falls back to the
+        palette, the star to white).
+
+  update <name>... | --all [--force] [--no-backup]
+        Re-clone outdated instances from the current Claude.app (clones don't
+        auto-update). Keeps the data dir, color and --disable-gpu; backs up the
+        data dir and the old bundle to ~/Library/Application Support/claudes-backups
+        and prints a one-line rollback. --force re-clones even if up to date.
+
+  repair <name> [--disable-gpu]
+        Re-apply wrapper + rename + icon + re-signature after an auto-update
+        clobbered the bundle. Safe to run repeatedly.
+
+  rename <old> <new>
+        Rename an instance (bundle + data dir + icon), preserving its color and
+        settings. Quit the instance first. Refuses if <new> already exists.
+
+  remove <name> [--keep-data] [-y]
+        Delete the instance bundle and its data dir (keep data with --keep-data).
+
+  list  Show all instances with bundle id, data size, isolation and signature.
+
+  doctor [--fix]
+        Health-check every instance; --fix auto-repairs broken ones.
+
+  install [name] [--dir <dir>]
+        Symlink this script onto your PATH so you can run it as a command
+        (default name: claudes). uninstall [name] removes the symlink.
+
+  version   Print the version.
+  help      This message.
+
+${C_BOLD}Notes:${C_RESET}
+  • First launch of a new instance prompts a Keychain dialog — click "Always Allow".
+  • Sign in / connect MCP connectors on ONE instance at a time (OAuth token race).
+  • Auto-update may break clones; re-run "$PROG doctor --fix" or "$PROG repair <name>".
+  • Clones fall behind the original's version; bring them up with "$PROG update --all".
+  • Custom icons use a built-in glyph; drop assets/claude-logo.svg next to the
+    script to override it. Needs rsvg-convert / ImageMagick / qlmanage.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-help}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+    add)            cmd_add "$@";;
+    update|upgrade) cmd_update "$@";;
+    repair)         cmd_repair "$@";;
+    rename|mv)      cmd_rename "$@";;
+    transfer)       cmd_transfer "$@";;
+    routines)       cmd_routines "$@";;
+    remove|rm)      cmd_remove "$@";;
+    list|ls)        cmd_list "$@";;
+    doctor)         cmd_doctor "$@";;
+    icon)           cmd_icon "$@";;
+    install)        cmd_install "$@";;
+    uninstall)      cmd_uninstall "$@";;
+    version|--version|-v) cmd_version;;
+    help|-h|--help) cmd_help;;
+    *)              err "unknown command: $cmd"; echo; cmd_help; exit 1;;
+  esac
+}
+
+main "$@"
